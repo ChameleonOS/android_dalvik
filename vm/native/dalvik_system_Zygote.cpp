@@ -20,9 +20,7 @@
 #include "Dalvik.h"
 #include "native/InternalNativePriv.h"
 
-#ifdef HAVE_SELINUX
 #include <selinux/android.h>
-#endif
 
 #include <signal.h>
 #if (__GNUC__ == 4 && __GNUC_MINOR__ == 7)
@@ -43,6 +41,8 @@
 #include <cutils/sched_policy.h>
 #include <cutils/multiuser.h>
 #include <sched.h>
+#include <sys/utsname.h>
+#include <sys/capability.h>
 
 #if defined(HAVE_PRCTL)
 # include <sys/prctl.h>
@@ -494,7 +494,6 @@ static int setCapabilities(int64_t permitted, int64_t effective)
     return 0;
 }
 
-#ifdef HAVE_SELINUX
 /*
  * Set SELinux security context.
  *
@@ -509,7 +508,26 @@ static int setSELinuxContext(uid_t uid, bool isSystemServer,
     return 0;
 #endif
 }
+
+static bool needsNoRandomizeWorkaround() {
+#if !defined(__arm__)
+    return false;
+#else
+    int major;
+    int minor;
+    struct utsname uts;
+    if (uname(&uts) == -1) {
+        return false;
+    }
+
+    if (sscanf(uts.release, "%d.%d", &major, &minor) != 2) {
+        return false;
+    }
+
+    // Kernels before 3.4.* need the workaround.
+    return (major < 3) || ((major == 3) && (minor < 4));
 #endif
+}
 
 /*
  * Basic KSM Support
@@ -582,10 +600,8 @@ static pid_t forkAndSpecializeCommon(const u4* args, bool isSystemServer)
     ArrayObject *rlimits = (ArrayObject *)args[4];
     u4 mountMode = MOUNT_EXTERNAL_NONE;
     int64_t permittedCapabilities, effectiveCapabilities;
-#ifdef HAVE_SELINUX
     char *seInfo = NULL;
     char *niceName = NULL;
-#endif
 
     if (isSystemServer) {
         /*
@@ -600,7 +616,6 @@ static pid_t forkAndSpecializeCommon(const u4* args, bool isSystemServer)
     } else {
         mountMode = args[5];
         permittedCapabilities = effectiveCapabilities = 0;
-#ifdef HAVE_SELINUX
         StringObject* seInfoObj = (StringObject*)args[6];
         if (seInfoObj) {
             seInfo = dvmCreateCstrFromString(seInfoObj);
@@ -617,7 +632,6 @@ static pid_t forkAndSpecializeCommon(const u4* args, bool isSystemServer)
                 dvmAbort();
             }
         }
-#endif
     }
 
     if (!gDvm.zygote) {
@@ -655,6 +669,21 @@ static pid_t forkAndSpecializeCommon(const u4* args, bool isSystemServer)
             }
         }
 
+        for (int i = 0; prctl(PR_CAPBSET_READ, i, 0, 0, 0) >= 0; i++) {
+            err = prctl(PR_CAPBSET_DROP, i, 0, 0, 0);
+            if (err < 0) {
+                if (errno == EINVAL) {
+                    ALOGW("PR_CAPBSET_DROP %d failed: %s. "
+                          "Please make sure your kernel is compiled with "
+                          "file capabilities support enabled.",
+                          i, strerror(errno));
+                } else {
+                    ALOGE("PR_CAPBSET_DROP %d failed: %s.", i, strerror(errno));
+                    dvmAbort();
+                }
+            }
+        }
+
 #endif /* HAVE_ANDROID_OS */
 
         if (mountMode != MOUNT_EXTERNAL_NONE) {
@@ -686,22 +715,24 @@ static pid_t forkAndSpecializeCommon(const u4* args, bool isSystemServer)
             dvmAbort();
         }
 
-        err = setgid(gid);
+        err = setresgid(gid, gid, gid);
         if (err < 0) {
-            ALOGE("cannot setgid(%d): %s", gid, strerror(errno));
+            ALOGE("cannot setresgid(%d): %s", gid, strerror(errno));
             dvmAbort();
         }
 
-        err = setuid(uid);
+        err = setresuid(uid, uid, uid);
         if (err < 0) {
-            ALOGE("cannot setuid(%d): %s", uid, strerror(errno));
+            ALOGE("cannot setresuid(%d): %s", uid, strerror(errno));
             dvmAbort();
         }
 
-        int current = personality(0xffffFFFF);
-        int success = personality((ADDR_NO_RANDOMIZE | current));
-        if (success == -1) {
-          ALOGW("Personality switch failed. current=%d error=%d\n", current, errno);
+        if (needsNoRandomizeWorkaround()) {
+            int current = personality(0xffffFFFF);
+            int success = personality((ADDR_NO_RANDOMIZE | current));
+            if (success == -1) {
+                ALOGW("Personality switch failed. current=%d error=%d\n", current, errno);
+            }
         }
 
         err = setCapabilities(permittedCapabilities, effectiveCapabilities);
@@ -717,7 +748,6 @@ static pid_t forkAndSpecializeCommon(const u4* args, bool isSystemServer)
             dvmAbort();
         }
 
-#ifdef HAVE_SELINUX
         err = setSELinuxContext(uid, isSystemServer, seInfo, niceName);
         if (err < 0) {
             ALOGE("cannot set SELinux context: %s\n", strerror(errno));
@@ -728,7 +758,6 @@ static pid_t forkAndSpecializeCommon(const u4* args, bool isSystemServer)
         // lock when we forked.
         free(seInfo);
         free(niceName);
-#endif
 
         /*
          * Our system thread ID has changed.  Get the new one.
@@ -748,10 +777,8 @@ static pid_t forkAndSpecializeCommon(const u4* args, bool isSystemServer)
         pushAnonymousPagesToKSM();
     } else if (pid > 0) {
         /* the parent process */
-#ifdef HAVE_SELINUX
         free(seInfo);
         free(niceName);
-#endif
     }
 
     return pid;
@@ -801,22 +828,6 @@ static void Dalvik_dalvik_system_Zygote_forkSystemServer(
     RETURN_INT(pid);
 }
 
-/* native private static void nativeExecShell(String command);
- */
-static void Dalvik_dalvik_system_Zygote_execShell(
-        const u4* args, JValue* pResult)
-{
-    StringObject* command = (StringObject*)args[0];
-
-    const char *argp[] = {_PATH_BSHELL, "-c", NULL, NULL};
-    argp[2] = dvmCreateCstrFromString(command);
-
-    ALOGI("Exec: %s %s %s", argp[0], argp[1], argp[2]);
-
-    execv(_PATH_BSHELL, (char**)argp);
-    exit(127);
-}
-
 const DalvikNativeMethod dvm_dalvik_system_Zygote[] = {
     { "nativeFork", "()I",
       Dalvik_dalvik_system_Zygote_fork },
@@ -824,7 +835,5 @@ const DalvikNativeMethod dvm_dalvik_system_Zygote[] = {
       Dalvik_dalvik_system_Zygote_forkAndSpecialize },
     { "nativeForkSystemServer", "(II[II[[IJJ)I",
       Dalvik_dalvik_system_Zygote_forkSystemServer },
-    { "nativeExecShell", "(Ljava/lang/String;)V",
-      Dalvik_dalvik_system_Zygote_execShell },
     { NULL, NULL, NULL },
 };
